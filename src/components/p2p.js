@@ -1,8 +1,11 @@
 import axios from 'axios'
 
-const Discovery = require('torrent-discovery')
+const WebSocketTracker = require('bittorrent-tracker/lib/client/websocket-tracker')
 const randombytes = require('randombytes')
 const WebTorrent = require('webtorrent')
+const EventEmitter = require('events')
+const chunks = require('chunk-stream')
+const str = require('string-to-stream')
 
 var announce = [
   'ws://localhost:5000',
@@ -36,25 +39,32 @@ if (localStorage.getItem('beAProxy') === "true") {
         // got a data channel message
         console.log('got a message from a client: ' + data)
 
-        if (data.toString() === 'p')
+        if (data.toString() === 'c')
           peer.send('p') // Pong
 
         try {
           var j = JSON.parse(data)
           axios.get(`//en.wikipedia.org/w/api.php?action=parse&format=json&page=${j.q}&prop=text&formatversion=2&origin=*`).then(res => {
             console.log(res)
-            peer.send(JSON.stringify(res))
+            var response = JSON.stringify(res)
+            const chunkLength = 16000;
+
+            while (response.length > 0) {
+              peer.send(response.slice(0, chunkLength))
+              response = response.slice(chunkLength)
+            }
+
+            console.log(response)
           }).catch((err) => {
             console.log(err)
-            alert('Not Found- Try with a more Specific Title')
           })
         } catch (e) {}
       })
     })
   })
 } else {
-  var peers = {},
-      bestPeers = [] // The last elem will have the last msged peer id
+  var peers = {}
+  var bestPeers = [] // The last elem will have the last msged peer id
   
   function removePeer(id) {
     delete peers[id]
@@ -62,33 +72,53 @@ if (localStorage.getItem('beAProxy') === "true") {
     msgBindCallback('peersCount', Object.keys(peers).length)
   }
 
-  const discoveryOpts = {
-    infoHash: infoHash,
-    peerId: randombytes(20),
-    announce: announce
+  class Client extends EventEmitter {
+    constructor() {
+      super()
+
+      this.infoHash = infoHash.toLowerCase()
+      this._infoHashBuffer = Buffer.from(this.infoHash, 'hex')
+      this._infoHashBinary = this._infoHashBuffer.toString('binary')
+
+      this._peerIdBuffer = randombytes(20)
+      this._peerId = this._peerIdBuffer.toString('hex')
+      this._peerIdBinary = this._peerIdBuffer.toString('binary')
+    }
+
+    _defaultAnnounceOpts (opts = {}) {
+      if (opts.numwant == null) opts.numwant = 50
+  
+      if (opts.uploaded == null) opts.uploaded = 0
+      if (opts.downloaded == null) opts.downloaded = 0
+
+      return opts
+    }
   }
 
-  var discovery = new Discovery(discoveryOpts)
-  discovery.on('peer', (peer, source) => {
-    peer.on('connect', () => {
-      peer.on('data', (data) => {
-        console.log('got a message from a proxy: ' + data)
+  client = new Client()
 
-        // Acknowledge pong
-        if (data.toString() === 'p') {
-          if (peers[peer.id] === undefined) {
-            peers[peer.id] = peer
-            bestPeers.push(peer.id)
+  var tracker = new WebSocketTracker(client, announce[0])
+  tracker.announce({
+    numwant: 50,
+  })
 
-            msgBindCallback('peersCount', Object.keys(peers).length)
-          }
+  client.on('peer', (peer) => {
+    peer.on('data', (d) => {
+      // Acknowledge pong
+      if (d.toString() === 'p') {
+        if (peers[peer.id] === undefined) {
+          peers[peer.id] = peer
+          bestPeers.push(peer.id)
 
-          // Move this "active" peer to last of array
-          // https://stackoverflow.com/a/24909567
-          bestPeers.push(bestPeers.splice(bestPeers.indexOf(peer.id), 1)[0])
+          msgBindCallback('peersCount', Object.keys(peers).length)
         }
-      })
 
+        // Move this "active" peer to last of array
+        // https://stackoverflow.com/a/24909567
+        bestPeers.push(bestPeers.splice(bestPeers.indexOf(peer.id), 1)[0])
+      }
+    })
+    peer.on('connect', () => {
       /**
        * Keep pinging
        */
@@ -96,20 +126,20 @@ if (localStorage.getItem('beAProxy') === "true") {
         if (!peer.connected) {
           removePeer(peer.id)
         } else {
-          peer.send('p') // A ping msg
-          setTimeout(t, 1000)
+          peer.send('c') // A ping msg
         }
       }
       setTimeout(t, 1000)
     })
-
+    peer.on('error', (err) => {
+      console.log(err)
+      removePeer(peer.id)
+      console.log('ccc')
+    })
     peer.on('close', () => {
       removePeer(peer.id)
+      console.log('cccaaa')
     })
-  })
-
-  discovery.on('error', err => {
-    console.log(err)
   })
 }
 
@@ -131,11 +161,16 @@ function messagePeer (msg) {
       msgBindCallback('search', 'No peers available')
       reject('nopeer')
     } else {
+      var previousData = '';
       peer.on('data', data => {
-        try {
-          var json = JSON.parse(data)
-          resolve(json)
-        } catch (e) {}
+        previousData += data.toString()
+        if (data.length !== 16000) {
+          try {
+            var json = JSON.parse(previousData)
+            previousData = '';
+            resolve(json)
+          } catch (e) {}
+        }
       })
       
       peer.send(msg)
